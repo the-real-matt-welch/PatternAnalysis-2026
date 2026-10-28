@@ -7,6 +7,9 @@ from pathlib import Path
 
 import nibabel as nib
 import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 
 # --------------------------------------------------------------------------- #
 # Constants / file parsing
@@ -133,6 +136,149 @@ def load_nifti_2d(path, dtype=np.float32):
     if arr.ndim != 2:
         raise ValueError(f"{path}: expected 2D slice after squeeze, got shape {arr.shape}")
     return arr
+
+
+def normalise_slice(img):
+    """Per-slice z-score using non-zero (foreground) pixels. img: (H, W) tensor."""
+    fg = img[img > 0]
+    if fg.numel() < 10:
+        fg = img.flatten()
+    mean, std = fg.mean(), fg.std()
+    return (img - mean) / (std + 1e-6)
+
+
+def to_one_hot(mask, num_classes):
+    """(H, W) or (B, H, W) long -> (C, H, W) or (B, C, H, W) float."""
+    oh = F.one_hot(mask.long(), num_classes)
+    return oh.permute(2, 0, 1).float() if mask.dim() == 2 else oh.permute(0, 3, 1, 2).float()
+
+
+def pad_to_multiple(img, mask, multiple=16):
+    """Pad bottom/right so H and W are divisible by ``multiple`` (needed for 4 poolings).
+    Returns padded tensors; use ``unpad`` with the original (H, W) to undo."""
+    h, w = mask.shape[-2:]
+    ph, pw = (-h) % multiple, (-w) % multiple
+    if ph == 0 and pw == 0:
+        return img, mask
+    img = F.pad(img, (0, pw, 0, ph), mode="constant", value=float(img.min()))
+    mask = F.pad(mask, (0, pw, 0, ph), mode="constant", value=0)
+    return img, mask
+
+
+def unpad(t, hw):
+    return t[..., :hw[0], :hw[1]]
+
+
+# --------------------------------------------------------------------------- #
+# Augmentation (torch-only; one shared geometric transform for image + mask)
+# --------------------------------------------------------------------------- #
+class JointAugment:
+    """Small affine (rotation/scale/translation) + intensity jitter + noise.
+    No flips: left/right and superior/inferior orientation are anatomically meaningful."""
+
+    def __init__(self, max_rot_deg=10.0, scale=(0.9, 1.1), max_shift=0.05,
+                 contrast=(0.9, 1.1), brightness=0.1, noise_std=0.03, p=0.8):
+        self.max_rot = max_rot_deg
+        self.scale = scale
+        self.max_shift = max_shift
+        self.contrast = contrast
+        self.brightness = brightness
+        self.noise_std = noise_std
+        self.p = p
+
+    def __call__(self, img, mask):
+        """img: (1, H, W) float; mask: (H, W) long."""
+        if torch.rand(1).item() > self.p:
+            return img, mask
+        _, h, w = img.shape
+        ang = math.radians((torch.rand(1).item() * 2 - 1) * self.max_rot)
+        s = self.scale[0] + torch.rand(1).item() * (self.scale[1] - self.scale[0])
+        tx = (torch.rand(1).item() * 2 - 1) * self.max_shift * 2
+        ty = (torch.rand(1).item() * 2 - 1) * self.max_shift * 2
+        c, sn = math.cos(ang) / s, math.sin(ang) / s
+        # Rotation in PIXEL space expressed in normalised coords (handles H != W).
+        theta = torch.tensor([[c, -sn * h / w, tx],
+                              [sn * w / h, c, ty]], dtype=torch.float32).unsqueeze(0)
+        grid = F.affine_grid(theta, (1, 1, h, w), align_corners=False)
+        img = F.grid_sample(img.unsqueeze(0), grid, mode="bilinear",
+                            padding_mode="border", align_corners=False).squeeze(0)
+        m = F.grid_sample(mask[None, None].float(), grid, mode="nearest",
+                          padding_mode="zeros", align_corners=False)
+        mask = m.squeeze(0).squeeze(0).round().long()
+        # Intensity jitter (image only)
+        a = self.contrast[0] + torch.rand(1).item() * (self.contrast[1] - self.contrast[0])
+        b = (torch.rand(1).item() * 2 - 1) * self.brightness
+        img = img * a + b + torch.randn_like(img) * self.noise_std
+        return img, mask
+
+
+# --------------------------------------------------------------------------- #
+# Dataset
+# --------------------------------------------------------------------------- #
+class HipMRIDataset(Dataset):
+    """2D HipMRI slices.
+
+    Item: dict(image=(1,H,W) float, mask=(H,W) long [or (C,H,W) one-hot float],
+               patient, week, slice)
+    """
+
+    def __init__(self, samples, num_classes=DEFAULT_NUM_CLASSES, augment=None,
+                 return_one_hot=False, pad_multiple=16, cache=True):
+        self.samples = list(samples)
+        self.num_classes = num_classes
+        self.augment = augment
+        self.return_one_hot = return_one_hot
+        self.pad_multiple = pad_multiple
+        self._cache = {} if cache else None
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _load(self, i):
+        if self._cache is not None and i in self._cache:
+            return self._cache[i]
+        s = self.samples[i]
+        img = normalise_slice(torch.from_numpy(load_nifti_2d(s["image"])))
+        mask = torch.from_numpy(np.rint(load_nifti_2d(s["mask"])).astype(np.int64))
+        if img.shape != mask.shape:
+            raise ValueError(f"Shape mismatch for {s['image']}: {tuple(img.shape)} vs {tuple(mask.shape)}")
+        if mask.min() < 0 or mask.max() >= self.num_classes:
+            raise ValueError(f"{s['mask']}: labels in [{int(mask.min())},{int(mask.max())}] "
+                             f"outside 0..{self.num_classes - 1}")
+        out = (img.unsqueeze(0).half() if self._cache is not None else img.unsqueeze(0), mask)
+        if self._cache is not None:
+            self._cache[i] = out
+        return out
+
+    def __getitem__(self, i):
+        img, mask = self._load(i)
+        img = img.float()
+        if self.augment is not None:
+            img, mask = self.augment(img, mask)
+        if self.pad_multiple:
+            img, mask = pad_to_multiple(img, mask, self.pad_multiple)
+        s = self.samples[i]
+        item = dict(image=img,
+                    mask=to_one_hot(mask, self.num_classes) if self.return_one_hot else mask,
+                    patient=s["patient"], week=s["week"], slice=s["slice"])
+        return item
+
+
+def get_dataloaders(root, batch_size=16, num_classes=DEFAULT_NUM_CLASSES, augment=True,
+                    use_provided=True, ratios=(0.70, 0.15, 0.15), seed=42,
+                    num_workers=2, return_one_hot=False, cache=True):
+    """Return (loaders dict, splits dict). Augmentation is applied to train only."""
+    splits = make_splits(root, use_provided=use_provided, ratios=ratios, seed=seed)
+    assert_no_leakage(splits)
+    loaders = {}
+    for name, samples in splits.items():
+        ds = HipMRIDataset(samples, num_classes=num_classes,
+                           augment=JointAugment() if (augment and name == "train") else None,
+                           return_one_hot=return_one_hot, cache=cache)
+        loaders[name] = DataLoader(ds, batch_size=batch_size, shuffle=(name == "train"),
+                                   num_workers=num_workers, pin_memory=torch.cuda.is_available(),
+                                   drop_last=(name == "train"))
+    return loaders, splits
 
 
 # --------------------------------------------------------------------------- #
