@@ -165,7 +165,25 @@ def pad_to_multiple(img, mask, multiple=16):
     return img, mask
 
 
+def pad_to_size(img, mask, target_hw):
+    """Pad bottom/right to exactly ``target_hw`` (H, W). Returns (img, mask, valid)
+    where ``valid`` is a (H, W) bool tensor, True on real (non-padded) pixels.
+    Padded image pixels get the slice's minimum (background) value; padded mask
+    pixels get class 0 -- so loss/metrics MUST be restricted to ``valid``."""
+    h, w = mask.shape[-2:]
+    th, tw = target_hw
+    if h > th or w > tw:
+        raise ValueError(f"Slice {(h, w)} larger than target {tuple(target_hw)}")
+    valid = torch.zeros(th, tw, dtype=torch.bool)
+    valid[:h, :w] = True
+    if (h, w) != (th, tw):
+        img = F.pad(img, (0, tw - w, 0, th - h), mode="constant", value=float(img.min()))
+        mask = F.pad(mask, (0, tw - w, 0, th - h), mode="constant", value=0)
+    return img, mask, valid
+
+
 def unpad(t, hw):
+    """Crop a padded tensor back to the original (H, W)."""
     return t[..., :hw[0], :hw[1]]
 
 
@@ -219,16 +237,22 @@ class HipMRIDataset(Dataset):
     """2D HipMRI slices.
 
     Item: dict(image=(1,H,W) float, mask=(H,W) long [or (C,H,W) one-hot float],
-               patient, week, slice)
+               valid=(H,W) bool, orig_h, orig_w, patient, week, slice)
+
+    All items are padded (bottom/right) to ``target_hw`` so mixed-width slices
+    (256x128 and 256x144) can be batched. ``valid`` marks real pixels: compute the
+    loss and metrics only where valid is True, and use ``unpad`` with (orig_h,
+    orig_w) to crop predictions back.
     """
 
     def __init__(self, samples, num_classes=DEFAULT_NUM_CLASSES, augment=None,
-                 return_one_hot=False, pad_multiple=16, cache=True):
+                 return_one_hot=False, target_hw=(256, 144), pad_multiple=16, cache=True):
         self.samples = list(samples)
         self.num_classes = num_classes
         self.augment = augment
         self.return_one_hot = return_one_hot
-        self.pad_multiple = pad_multiple
+        self.target_hw = tuple(target_hw) if target_hw else None
+        self.pad_multiple = pad_multiple  # only used when target_hw is None
         self._cache = {} if cache else None
 
     def __len__(self):
@@ -255,18 +279,23 @@ class HipMRIDataset(Dataset):
         img = img.float()
         if self.augment is not None:
             img, mask = self.augment(img, mask)
-        if self.pad_multiple:
+        orig_h, orig_w = mask.shape
+        if self.target_hw is not None:
+            img, mask, valid = pad_to_size(img, mask, self.target_hw)
+        else:
             img, mask = pad_to_multiple(img, mask, self.pad_multiple)
+            valid = torch.zeros(mask.shape, dtype=torch.bool)
+            valid[:orig_h, :orig_w] = True
         s = self.samples[i]
-        item = dict(image=img,
+        return dict(image=img,
                     mask=to_one_hot(mask, self.num_classes) if self.return_one_hot else mask,
+                    valid=valid, orig_h=orig_h, orig_w=orig_w,
                     patient=s["patient"], week=s["week"], slice=s["slice"])
-        return item
 
 
 def get_dataloaders(root, batch_size=16, num_classes=DEFAULT_NUM_CLASSES, augment=True,
                     use_provided=True, ratios=(0.70, 0.15, 0.15), seed=42,
-                    num_workers=2, return_one_hot=False, cache=True):
+                    num_workers=2, return_one_hot=False, target_hw=(256, 144), cache=True):
     """Return (loaders dict, splits dict). Augmentation is applied to train only."""
     splits = make_splits(root, use_provided=use_provided, ratios=ratios, seed=seed)
     assert_no_leakage(splits)
@@ -274,7 +303,7 @@ def get_dataloaders(root, batch_size=16, num_classes=DEFAULT_NUM_CLASSES, augmen
     for name, samples in splits.items():
         ds = HipMRIDataset(samples, num_classes=num_classes,
                            augment=JointAugment() if (augment and name == "train") else None,
-                           return_one_hot=return_one_hot, cache=cache)
+                           return_one_hot=return_one_hot, target_hw=target_hw, cache=cache)
         loaders[name] = DataLoader(ds, batch_size=batch_size, shuffle=(name == "train"),
                                    num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                                    drop_last=(name == "train"))
