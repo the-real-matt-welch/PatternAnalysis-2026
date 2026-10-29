@@ -37,7 +37,7 @@ from torch.utils.data import DataLoader
 
 from dataset import (BLADDER_ID, CLASS_NAMES, PROSTATE_ID, RECTUM_ID, HipMRIDataset,
                      load_nifti_2d, make_splits, normalise_slice, pad_to_size)
-from modules import SegMetrics, UNet, count_parameters
+from modules import SegMetrics, build_model, count_parameters
 from train import check_criteria, regional_analysis
 
 CLASS_ALPHA = np.array([0.0, 0.18, 0.5, 0.6, 0.6, 0.7])  # body is faint so it does not hide the anatomy
@@ -58,7 +58,8 @@ def nan_to_none(x):
 def load_model(run_dir, ckpt_name, device):
     ck = torch.load(Path(run_dir) / ckpt_name, map_location=device)
     a = ck["args"]
-    model = UNet(1, a["num_classes"], base=a["base"], dropout=a.get("dropout", 0.0))
+    model = build_model(a.get("model", "unet"), 1, a["num_classes"], base=a["base"],
+                        dropout=a.get("dropout", 0.0))
     model.load_state_dict(ck["model"])
     model.to(device).eval()
     print(f"Loaded {ckpt_name}: epoch {ck['epoch']}, val fg Dice {ck['val_fg_dice']:.4f}, "

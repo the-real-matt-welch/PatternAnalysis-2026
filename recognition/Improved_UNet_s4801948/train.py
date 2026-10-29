@@ -27,7 +27,7 @@ import torch
 
 from dataset import (BLADDER_ID, CLASS_NAMES, DEFAULT_NUM_CLASSES, PROSTATE_ID, RECTUM_ID,
                      get_dataloaders)
-from modules import DiceCELoss, SegMetrics, UNet, count_parameters, leakage_counts
+from modules import DiceCELoss, SegMetrics, build_model, count_parameters, leakage_counts
 
 STOP_REQUESTED = False
 
@@ -251,12 +251,13 @@ def main():
     ap.add_argument("--root", required=True)
     ap.add_argument("--out_dir", default="runs/unet")
     ap.add_argument("--num_classes", type=int, default=DEFAULT_NUM_CLASSES)
-    ap.add_argument("--base", type=int, default=64)
+    ap.add_argument("--model", default="unet", choices=["unet", "improved"])
+    ap.add_argument("--base", type=int, default=None, help="default: 64 (unet) / 32 (improved)")
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight_decay", type=float, default=1e-5)
-    ap.add_argument("--dropout", type=float, default=0.0)
+    ap.add_argument("--dropout", type=float, default=None, help="default: 0.0 (unet) / 0.3 (improved)")
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--patience", type=int, default=15, help="early-stop after N epochs without val improvement (0 = off)")
@@ -271,6 +272,10 @@ def main():
     ap.add_argument("--rectum_class", type=int, default=RECTUM_ID)
     ap.add_argument("--bladder_class", type=int, default=BLADDER_ID)
     args = ap.parse_args()
+    if args.base is None:
+        args.base = 64 if args.model == "unet" else 32
+    if args.dropout is None:
+        args.dropout = 0.0 if args.model == "unet" else 0.3
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
     set_seed(args.seed)
@@ -292,8 +297,8 @@ def main():
                                       num_workers=args.num_workers, cache=not args.no_cache)
     print({k: f"{len(v)} slices / {len({s['patient'] for s in v})} patients" for k, v in splits.items()})
 
-    model = UNet(1, args.num_classes, base=args.base, dropout=args.dropout).to(device)
-    print(f"U-Net base={args.base}: {count_parameters(model) / 1e6:.2f} M parameters")
+    model = build_model(args.model, 1, args.num_classes, base=args.base, dropout=args.dropout).to(device)
+    print(f"{args.model} base={args.base} dropout={args.dropout}: {count_parameters(model) / 1e6:.2f} M parameters")
     loss_fn = DiceCELoss(args.num_classes, include_background_in_dice=False).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)

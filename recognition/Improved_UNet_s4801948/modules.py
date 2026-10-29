@@ -244,6 +244,18 @@ class ImprovedUNet(nn.Module):
         return seg
 
 
+def build_model(name, in_channels=1, num_classes=6, base=None, dropout=None, **kwargs):
+    """name: "unet" (baseline, base 64, BN, no dropout) or "improved" (base 32, IN, dropout 0.3).
+    ``None`` for base/dropout selects each model's own default."""
+    if name == "unet":
+        return UNet(in_channels, num_classes, base=64 if base is None else base,
+                    dropout=0.0 if dropout is None else dropout, **kwargs)
+    if name == "improved":
+        return ImprovedUNet(in_channels, num_classes, base=32 if base is None else base,
+                            dropout=0.3 if dropout is None else dropout, **kwargs)
+    raise ValueError(f"Unknown model '{name}' (expected 'unet' or 'improved')")
+
+
 # --------------------------------------------------------------------------- #
 # Loss
 # --------------------------------------------------------------------------- #
