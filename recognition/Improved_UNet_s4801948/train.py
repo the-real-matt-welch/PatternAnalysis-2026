@@ -21,6 +21,7 @@ Usage:
 import argparse
 import csv
 import json
+import math
 import random
 import signal
 import time
@@ -59,34 +60,48 @@ def set_seed(seed):
 # --------------------------------------------------------------------------- #
 # Train / evaluate
 # --------------------------------------------------------------------------- #
-def train_one_epoch(model, loader, loss_fn, opt, scaler, device, use_amp, clip=1.0):
+def model_is_finite(model):
+    return all(torch.isfinite(p).all().item() for p in model.parameters())
+
+
+def train_one_epoch(model, loader, loss_fn, opt, scaler, device, use_amp, amp_dtype=torch.float16, clip=1.0):
+    """One epoch. Batches with a non-finite loss or gradient are skipped and counted, so a
+    single bad batch cannot corrupt the weights. Returns (mean loss over good batches, n_bad)."""
     model.train()
-    total, n = 0.0, 0
+    total, n, n_bad = 0.0, 0, 0
     for b in loader:
         x = b["image"].to(device, non_blocking=True)
         y = b["mask"].to(device, non_blocking=True)
         v = b["valid"].to(device, non_blocking=True)
-        with torch.autocast(device.type, enabled=use_amp):
+        with torch.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             logits = model(x)
         loss = loss_fn(logits.float(), y, v)
+        if not torch.isfinite(loss):
+            n_bad += 1
+            opt.zero_grad(set_to_none=True)
+            continue
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-        scaler.step(opt)
+        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        if not scaler.is_enabled() and not torch.isfinite(gnorm):
+            n_bad += 1  # no GradScaler to skip the step for us (bf16 / fp32)
+            opt.zero_grad(set_to_none=True)
+            continue
+        scaler.step(opt)  # with fp16 the scaler itself skips steps with inf/NaN grads
         scaler.update()
         total += loss.item()
         n += 1
-    return total / max(n, 1)
+    return total / max(n, 1) if n else float("nan"), n_bad
 
 
 @torch.no_grad()
-def evaluate(model, loader, loss_fn, device, num_classes, use_amp, cls_ids=None):
+def evaluate(model, loader, loss_fn, device, num_classes, use_amp, cls_ids=None, amp_dtype=torch.float16):
     """Evaluate on a loader. If ``cls_ids`` (dict prostate/bladder/rectum) is given, also
     collect per-slice prostate statistics and leakage counts for the test analysis."""
     model.eval()
     metrics = SegMetrics(num_classes)
-    total_loss, n_batches = 0.0, 0
+    total_loss, n_batches, n_bad = 0.0, 0, 0
     records = []
     leak = {"rectum": [0, 0], "bladder": [0, 0]}
     infer_time, infer_slices = 0.0, 0
@@ -96,15 +111,19 @@ def evaluate(model, loader, loss_fn, device, num_classes, use_amp, cls_ids=None)
         v = b["valid"].to(device, non_blocking=True)
         sync(device)
         t0 = time.perf_counter()
-        with torch.autocast(device.type, enabled=use_amp):
+        with torch.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             logits = model(x)
         sync(device)
         if bi > 0:  # skip first batch (warm-up)
             infer_time += time.perf_counter() - t0
             infer_slices += x.shape[0]
         logits = logits.float()
-        total_loss += loss_fn(logits, y, v).item()
-        n_batches += 1
+        batch_loss = loss_fn(logits, y, v).item()
+        if math.isfinite(batch_loss):
+            total_loss += batch_loss
+            n_batches += 1
+        else:
+            n_bad += 1
         pred = logits.argmax(1)
         metrics.update(pred.cpu(), y.cpu(), v.cpu())
 
@@ -121,7 +140,8 @@ def evaluate(model, loader, loss_fn, device, num_classes, use_amp, cls_ids=None)
                 leak[name][0] += num
                 leak[name][1] += den
     out = metrics.compute()
-    out["loss"] = total_loss / max(n_batches, 1)
+    out["loss"] = total_loss / n_batches if n_batches else float("nan")
+    out["n_bad_batches"] = n_bad
     out["ms_per_slice_batched"] = 1e3 * infer_time / infer_slices if infer_slices else None
     if cls_ids is not None:
         out["records"], out["leak"] = records, leak
@@ -270,6 +290,8 @@ def main():
     ap.add_argument("--patience", type=int, default=15, help="early-stop after N epochs without val improvement (0 = off)")
     ap.add_argument("--time_limit_h", type=float, default=0.0, help="stop gracefully after this many hours (0 = off)")
     ap.add_argument("--no_amp", action="store_true")
+    ap.add_argument("--amp_dtype", default="fp16", choices=["fp16", "bf16"],
+                    help="bf16 cannot overflow like fp16 (recommended for the improved model)")
     ap.add_argument("--no_cache", action="store_true")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--test_only", action="store_true")
@@ -295,7 +317,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = (device.type == "cuda") and not args.no_amp
     torch.backends.cudnn.benchmark = True
-    print(f"Device: {device}  AMP: {use_amp}")
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+    print(f"Device: {device}  AMP: {use_amp} ({args.amp_dtype if use_amp else 'off'})")
     cls_ids = dict(prostate=args.prostate_class, rectum=args.rectum_class, bladder=args.bladder_class)
     print(f"Class ids: {cls_ids}")
 
@@ -309,7 +332,7 @@ def main():
     loss_fn = DiceCELoss(args.num_classes, include_background_in_dice=False).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
 
     history, best, bad_epochs, start_epoch = [], -1.0, 0, 1
     if args.resume and (out_dir / "last.pt").exists():
@@ -327,12 +350,21 @@ def main():
         stopped_early = None
         for epoch in range(start_epoch, args.epochs + 1):
             t0 = time.time()
-            tr_loss = train_one_epoch(model, loaders["train"], loss_fn, opt, scaler, device, use_amp)
-            val = evaluate(model, loaders["val"], loss_fn, device, args.num_classes, use_amp)
+            tr_loss, n_bad_tr = train_one_epoch(model, loaders["train"], loss_fn, opt, scaler, device,
+                                                use_amp, amp_dtype)
+            val = evaluate(model, loaders["val"], loss_fn, device, args.num_classes, use_amp,
+                           amp_dtype=amp_dtype)
+            if not model_is_finite(model):
+                print(f"[train] ABORT at epoch {epoch}: model weights are non-finite "
+                      f"({n_bad_tr} bad train batches). last.pt/best.pt NOT overwritten; "
+                      f"restart from a clean out_dir (or --resume, which reloads the last good epoch) "
+                      f"with --amp_dtype bf16 and/or a lower --lr.")
+                return
             sched.step()
             history.append(dict(epoch=epoch, lr=opt.param_groups[0]["lr"], train_loss=tr_loss,
                                 val_loss=val["loss"], val_mean_fg_dice=val["mean_dice_fg"],
                                 val_mean_iou=val["mean_iou"],
+                                n_bad_train=n_bad_tr, n_bad_val=val["n_bad_batches"],
                                 val_dice_per_class=nan_to_none(val["dice"].tolist()),
                                 val_iou_per_class=nan_to_none(val["iou"].tolist()),
                                 epoch_time_s=time.time() - t0))
@@ -350,6 +382,9 @@ def main():
             print(f"[{epoch:3d}/{args.epochs}] train {tr_loss:.4f} | val {val['loss']:.4f} | "
                   f"fg Dice {val['mean_dice_fg']:.4f}{' *' if improved else ''} | per-class {dpc} | "
                   f"{time.time() - t0:.0f}s", flush=True)
+            if n_bad_tr or val["n_bad_batches"]:
+                print(f"        WARNING: skipped {n_bad_tr} non-finite train batches, "
+                      f"{val['n_bad_batches']} non-finite val batches", flush=True)
 
             if args.patience and bad_epochs >= args.patience:
                 stopped_early = f"early stop (no improvement for {bad_epochs} epochs)"; break
@@ -371,7 +406,8 @@ def main():
     ck = torch.load(out_dir / "best.pt", map_location=device)
     model.load_state_dict(ck["model"])
     print(f"Testing best checkpoint (epoch {ck['epoch']}, val fg Dice {ck['val_fg_dice']:.4f})")
-    test = evaluate(model, loaders["test"], loss_fn, device, args.num_classes, use_amp, cls_ids)
+    test = evaluate(model, loaders["test"], loss_fn, device, args.num_classes, use_amp, cls_ids,
+                    amp_dtype=amp_dtype)
     regional = regional_analysis(test["records"])
     crit = check_criteria(test, regional, test["leak"], args, cls_ids)
 

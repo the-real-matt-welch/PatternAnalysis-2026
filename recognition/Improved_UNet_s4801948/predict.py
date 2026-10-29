@@ -63,12 +63,12 @@ def load_model(run_dir, ckpt_name, device):
     model.load_state_dict(ck["model"])
     model.to(device).eval()
     print(f"Loaded {ckpt_name}: epoch {ck['epoch']}, val fg Dice {ck['val_fg_dice']:.4f}, "
-          f"base={a['base']}, {count_parameters(model) / 1e6:.2f} M params")
+          f"model={a.get('model', 'unet')}, base={a['base']}, {count_parameters(model) / 1e6:.2f} M params")
     return model, a["num_classes"], ck
 
 
 @torch.no_grad()
-def run_inference(model, samples, num_classes, device, use_amp, batch_size):
+def run_inference(model, samples, num_classes, device, use_amp, batch_size, amp_dtype=torch.float16):
     """Predict every slice in ``samples``; returns arrays (padded size) + metadata."""
     ds = HipMRIDataset(samples, num_classes=num_classes, augment=None, cache=True)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
@@ -77,7 +77,7 @@ def run_inference(model, samples, num_classes, device, use_amp, batch_size):
         x = b["image"].to(device)
         sync(device)
         t0 = time.perf_counter()
-        with torch.autocast(device.type, enabled=use_amp):
+        with torch.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             logits = model(x)
         sync(device)
         t_inf += time.perf_counter() - t0
@@ -308,6 +308,8 @@ def main():
     ap.add_argument("--min_area", type=int, default=20, help="min GT prostate pixels for a slice to count as a case")
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--no_amp", action="store_true")
+    ap.add_argument("--amp_dtype", choices=["fp16", "bf16"], default=None,
+                    help="default: whatever the checkpoint was trained with")
     ap.add_argument("--prostate_class", type=int, default=PROSTATE_ID)
     ap.add_argument("--rectum_class", type=int, default=RECTUM_ID)
     ap.add_argument("--bladder_class", type=int, default=BLADDER_ID)
@@ -318,6 +320,8 @@ def main():
     out_dir = Path(args.out_dir or Path(args.run_dir) / "predictions")
     out_dir.mkdir(parents=True, exist_ok=True)
     model, C, ck = load_model(args.run_dir, args.ckpt, device)
+    amp_name = args.amp_dtype or ck["args"].get("amp_dtype", "fp16")
+    amp_dtype = torch.bfloat16 if amp_name == "bf16" else torch.float16
     cls = dict(prostate=args.prostate_class, rectum=args.rectum_class, bladder=args.bladder_class)
 
     if args.image:
@@ -329,7 +333,7 @@ def main():
     samples = make_splits(args.root)[args.split]
     print(f"Predicting {len(samples)} '{args.split}' slices from "
           f"{len({s['patient'] for s in samples})} patients on {device}")
-    d, ms = run_inference(model, samples, C, device, use_amp, args.batch_size)
+    d, ms = run_inference(model, samples, C, device, use_amp, args.batch_size, amp_dtype)
 
     # ---- metrics ----
     metrics = SegMetrics(C)
@@ -369,7 +373,7 @@ def main():
     print(f"Leakage of predicted prostate into rectum {crit['A3_leakage_rectum']:.2%}, "
           f"bladder {crit['A3_leakage_bladder']:.2%}")
     print("Acceptance criteria:", {k: v for k, v in crit.items() if k.endswith("pass")})
-    print(f"Inference: {ms:.2f} ms/slice (batch {args.batch_size}, {'AMP' if use_amp else 'fp32'})")
+    print(f"Inference: {ms:.2f} ms/slice (batch {args.batch_size}, {amp_name if use_amp else 'fp32'})")
 
     # ---- figures ----
     dices = np.array([slice_dice(r) for r in records])
