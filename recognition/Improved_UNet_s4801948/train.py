@@ -25,7 +25,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 
-from dataset import DEFAULT_NUM_CLASSES, get_dataloaders
+from dataset import (BLADDER_ID, CLASS_NAMES, DEFAULT_NUM_CLASSES, PROSTATE_ID, RECTUM_ID,
+                     get_dataloaders)
 from modules import DiceCELoss, SegMetrics, UNet, count_parameters, leakage_counts
 
 STOP_REQUESTED = False
@@ -265,10 +266,10 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--test_only", action="store_true")
     ap.add_argument("--resplit", action="store_true", help="ignore provided folders; patient-level re-split")
-    # ASSUMED class ids -- confirm with a visual label check before trusting A1-A3
-    ap.add_argument("--prostate_class", type=int, default=5)
-    ap.add_argument("--rectum_class", type=int, default=4)
-    ap.add_argument("--bladder_class", type=int, default=3)
+    # Class ids confirmed by visual label check (see dataset.CLASS_NAMES)
+    ap.add_argument("--prostate_class", type=int, default=PROSTATE_ID)
+    ap.add_argument("--rectum_class", type=int, default=RECTUM_ID)
+    ap.add_argument("--bladder_class", type=int, default=BLADDER_ID)
     args = ap.parse_args()
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
@@ -284,7 +285,7 @@ def main():
     torch.backends.cudnn.benchmark = True
     print(f"Device: {device}  AMP: {use_amp}")
     cls_ids = dict(prostate=args.prostate_class, rectum=args.rectum_class, bladder=args.bladder_class)
-    print(f"ASSUMED class ids: {cls_ids}  (verify against a visual label check)")
+    print(f"Class ids: {cls_ids}")
 
     loaders, splits = get_dataloaders(args.root, batch_size=args.batch_size, num_classes=args.num_classes,
                                       use_provided=not args.resplit, seed=args.seed,
@@ -377,10 +378,10 @@ def main():
     lat = 1e3 * (time.perf_counter() - t0) / max(len(xs) - 10, 1)
 
     print("\n=== TEST RESULTS (best checkpoint) ===")
-    print("class | Dice  | IoU")
+    print("class            | Dice   | IoU")
     for c in range(args.num_classes):
         d, i = test["dice"][c].item(), test["iou"][c].item()
-        print(f"  {c}   | {d:.4f} | {i:.4f}")
+        print(f"  {c} {CLASS_NAMES.get(c, '?'):<12} | {d:.4f} | {i:.4f}")
     print(f"mean fg Dice {test['mean_dice_fg']:.4f} | mean IoU {test['mean_iou']:.4f}")
     print(f"Prostate (class {args.prostate_class}) regional Dice: base {regional['overall']['base']:.3f} | "
           f"mid {regional['overall']['mid']:.3f} | apex {regional['overall']['apex']:.3f}")

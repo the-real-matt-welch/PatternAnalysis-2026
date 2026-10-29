@@ -22,6 +22,9 @@ FOLDERS = {
 _NAME_RE = re.compile(r"^(case|seg)_(\d+)_week_(\d+)_slice_(\d+)\.nii(\.gz)?$")
 
 DEFAULT_NUM_CLASSES = 6  # verify with audit_dataset(); label ids are 0..C-1
+# Confirmed by visual label check (check_labels.py)
+CLASS_NAMES = {0: "background", 1: "body", 2: "bone", 3: "bladder", 4: "rectum", 5: "prostate"}
+BLADDER_ID, RECTUM_ID, PROSTATE_ID = 3, 4, 5
 CACHE_HW = (256, 144)  # canvas for the RAM cache; slices are stored top-left aligned
 
 
