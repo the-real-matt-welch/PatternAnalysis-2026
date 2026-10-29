@@ -1,7 +1,7 @@
 """
 modules.py -- model components, loss and metrics for 2D HipMRI segmentation.
 
-Pure PyTorch. Contents
+Contents
 ---------------------------------
 * UNet            : configurable-width/depth 2D U-Net (Ronneberger et al., 2015),
                     with BatchNorm and "same" padding so output size == input size.
@@ -122,6 +122,126 @@ class UNet(nn.Module):
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+# --------------------------------------------------------------------------- #
+# Improved U-Net
+# --------------------------------------------------------------------------- #
+class ConvNormAct(nn.Module):
+    """Conv -> InstanceNorm -> LeakyReLU (used in the upsampling/localization modules)."""
+
+    def __init__(self, in_ch, out_ch, kernel_size=3, neg_slope=0.01):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size, padding=kernel_size // 2, bias=False),
+            nn.InstanceNorm2d(out_ch, affine=True),
+            nn.LeakyReLU(neg_slope, inplace=True))
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class PreActResBlock(nn.Module):
+    """Pre-activation residual 'context module':
+        y = conv(act(norm(x)));  y = dropout(y);  y = conv(act(norm(y)));  return x + y
+    Normalisation and activation come BEFORE each convolution, so the identity path is
+    never normalised or rectified: gradients flow through the skip connection unchanged."""
+
+    def __init__(self, ch, dropout=0.3, neg_slope=0.01):
+        super().__init__()
+        self.norm1 = nn.InstanceNorm2d(ch, affine=True)
+        self.conv1 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
+        self.drop = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+        self.norm2 = nn.InstanceNorm2d(ch, affine=True)
+        self.conv2 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
+        self.act = nn.LeakyReLU(neg_slope, inplace=True)
+
+    def forward(self, x):
+        y = self.conv1(self.act(self.norm1(x)))
+        y = self.drop(y)
+        y = self.conv2(self.act(self.norm2(y)))
+        return x + y
+
+
+class ImprovedUNet(nn.Module):
+    """2D Improved U-Net.
+
+    Encoder  : 3x3 stem conv -> context module; each deeper level = stride-2 3x3 conv
+               (learned downsampling) -> context module.
+    Decoder  : upsampling module (nearest x2 + 3x3 conv halving channels), concatenation with
+               the encoder skip, localization module (3x3 conv, then 1x1 conv halving channels).
+    Deep supervision: 1x1 segmentation layers on the ``ds_levels`` highest-resolution decoder
+               levels; each is upsampled x2 and added element-wise to the next finer level's
+               segmentation map, so the final logits are the SUM of multi-scale predictions and
+               early/coarse decoder layers receive a direct gradient.
+
+    Args:
+        base      : filters at the first level (paper: 16 in 3D; 32 is a good 2D default).
+        depth     : number of down-sampling steps; H and W must be divisible by 2**depth.
+        dropout   : Dropout2d probability inside every context module (paper: 0.3).
+        ds_levels : number of decoder levels with a segmentation head (<= depth; paper: 3).
+    forward(x) -> logits (B, C, H, W). With return_aux=True returns (logits, [per-level
+    head outputs at native resolution, finest first]) for optional auxiliary losses.
+    """
+
+    def __init__(self, in_channels=1, num_classes=6, base=32, depth=4, dropout=0.3,
+                 ds_levels=3, neg_slope=0.01):
+        super().__init__()
+        self.depth = depth
+        self.n_heads = min(ds_levels, depth)
+        self.neg_slope = neg_slope
+        w = [base * 2 ** i for i in range(depth + 1)]
+
+        self.stem = nn.Conv2d(in_channels, w[0], 3, padding=1)
+        self.enc_blocks = nn.ModuleList(PreActResBlock(w[i], dropout, neg_slope) for i in range(depth + 1))
+        self.down_convs = nn.ModuleList(nn.Conv2d(w[i - 1], w[i], 3, stride=2, padding=1)
+                                        for i in range(1, depth + 1))
+
+        # decoder modules ordered from the deepest level (depth-1) up to level 0
+        self.up_modules = nn.ModuleList(
+            nn.Sequential(nn.Upsample(scale_factor=2, mode="nearest"),
+                          ConvNormAct(w[i + 1], w[i], 3, neg_slope))
+            for i in reversed(range(depth)))
+        self.loc_modules = nn.ModuleList(
+            nn.Sequential(ConvNormAct(2 * w[i], 2 * w[i], 3, neg_slope),
+                          ConvNormAct(2 * w[i], w[i], 1, neg_slope))
+            for i in reversed(range(depth)))
+        # heads[l] sits on decoder level l (0 = full resolution)
+        self.heads = nn.ModuleList(nn.Conv2d(w[l], num_classes, 1) for l in range(self.n_heads))
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, a=self.neg_slope, nonlinearity="leaky_relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x, return_aux=False):
+        if x.shape[-2] % (2 ** self.depth) or x.shape[-1] % (2 ** self.depth):
+            raise ValueError(f"Input {tuple(x.shape[-2:])} must be divisible by {2 ** self.depth}")
+        x = self.enc_blocks[0](self.stem(x))
+        skips = [x]
+        for i in range(1, self.depth + 1):
+            x = self.enc_blocks[i](self.down_convs[i - 1](x))
+            if i < self.depth:
+                skips.append(x)
+
+        head_out = {}
+        for j, level in enumerate(reversed(range(self.depth))):
+            x = self.up_modules[j](x)
+            x = self.loc_modules[j](torch.cat([skips[level], x], dim=1))
+            if level < self.n_heads:
+                head_out[level] = self.heads[level](x)
+
+        seg = None  # combine coarse -> fine by upsample + element-wise sum
+        for level in reversed(range(self.n_heads)):
+            h = head_out[level]
+            seg = h if seg is None else F.interpolate(seg, size=h.shape[-2:], mode="bilinear",
+                                                      align_corners=False) + h
+        if return_aux:
+            return seg, [head_out[l] for l in range(self.n_heads)]
+        return seg
 
 
 # --------------------------------------------------------------------------- #
