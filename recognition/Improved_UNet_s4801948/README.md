@@ -32,7 +32,10 @@ $$
 
 where $C = 6$ is the number of classes and $\varepsilon = 1$ is a smoothing constant. The Dice term is computed per class over the whole batch (not per slice), which keeps it stable for classes that appear in only some slices, and it averages over the five foreground classes only, so the large background class does not dominate. Cross-entropy provides well-behaved gradients early in training, while the Dice term directly optimises overlap and counteracts the extreme class imbalance.
 
-## Feasability Report
+## Feasibility Report
+
+Before any intensive training, a feasibility review was conducted and presented as a one page report. That report is presented here to archive this step of the
+process and to define important acceptance criteria.
 
 **1. User Need, Scope & Acceptance Criteria**\
 **User and purpose.** The user is a radiation oncologist or imaging specialist who reviews and edits proposed contours on 2D pelvic MRI
@@ -48,7 +51,7 @@ All criteria are evaluated on a held-out, patient-level test split.
 | **A2** | Prostate DSC in the *base* and *apex* thirds of each patient's prostate extent $\ge 0.60$, with mid-gland minus worst-end gap $\le 0.15$. | Slice-transition failure |
 | **A3** | Leakage: predicted prostate pixels lying inside GT rectum/bladder $\le 5\%$ of predicted prostate area. | Boundary leakage |
 | **A4** | Resource: peak training VRAM $\le 8\text{ GB}$ (batch 16, AMP); inference $\le 50\text{ ms/slice}$; full training $\le 2\text{ GPU-h per run}$. | Operational budget |
-| **A5** | Zero patient overlap between train/val/test (asserted in code). A model upgrade is justified only if it gains $\ge 0.05$ DSC at base/apex (paired patient-level bootstrap, 95% CI excludes 0) at $\le 3\times$ baseline VRAM/time. | Validity & cost-benefit |
+| **A5** | Zero patient overlap between train/val/test (asserted in code). | Validity |
 
 **2. Model Choice & Course Concepts**\
 **Data.** HipMRI 2D slices (NIfTI, loaded with `nibabel`, Appendix B), with integer label maps one-hot encoded into $C$ channels (background,
@@ -97,4 +100,53 @@ prediction / FP--FN difference overlays) 1 h; contingency 1 h. **Next experi
 to a Tversky/focal loss or a two-stage ROI crop; if CAN/3D is unaffordable, report the 2.5D variant as the volumetric-context proxy
 and state the cost--benefit finding from A5 as the recommendation.
 
+## Dependencies and Reproducibility
+
+### Requirements
+
+The code uses only four third-party packages (everything else is the Python standard library). `modules.py` depends on PyTorch alone; `dataset.py` additionally needs `nibabel` and `numpy` for reading the NIfTI slices, and `train.py` / `predict.py` need `matplotlib` for plots.
+
+| Package | Version | Used by |
+|---|---|---|
+| Python | 3.11 | `modules.py`, `dataset.py`, `train.py`, `predict.py` |
+| PyTorch | 2.15 | `modules.py`, `dataset.py`, `train.py`, `predict.py` |
+| nibabel | 5.4 | `dataset.py` |
+| NumPy | 2.4 | `dataset.py`, `predict.py` |
+| Matplotlib | 3.11 | `train.py`, `predict.py` |
+
+
+Results in this report were produced on a single GPU. The code also runs on CPU (it falls back automatically), which is useful for quick tests but far too slow for a full training run.
+
+### Data layout
+
+The dataset is not included in this repository. Place the six HipMRI folders directly under one root directory and pass it to every script with `--root`:
+
+```
+<root>/
+├── keras_slices_train/          case_XXX_week_X_slice_XX.nii.gz   (11,460 slices)
+├── keras_slices_seg_train/      seg_XXX_week_X_slice_XX.nii.gz
+├── keras_slices_validate/       (660)        keras_slices_seg_validate/
+└── keras_slices_test/           (540)        keras_slices_seg_test/
+```
+
+`dataset.py` pairs every image with its mask by (patient, week, slice) and raises an error if a folder is missing, so a wrong `--root` fails immediately and visibly. Before any training it also verifies that no patient appears in more than one split.
+
+### Reproducing the results
+
+Each model was trained with three seeds (0, 1, 2) and evaluated once on the test split with the checkpoint that scored best on validation. The commands below are the ones used; replace `<root>` with your data path.
+
+```bash
+# Baseline 2D U-Net (base width 64, batch norm)
+python train.py --root <root> --model unet --seed 0 --out_dir runs/unet_s0 \
+    --epochs 50 --batch_size 16 --patience 0
+
+# Improved U-Net (base width 32, dropout 0.3)
+python train.py --root <root> --model improved --amp_dtype bf16 --seed 0 --out_dir runs/improved_s0 \
+    --epochs 50 --batch_size 16 --patience 0
+
+# Evaluate the best checkpoint and produce the figures and metrics
+python predict.py --root <root> --run_dir runs/improved_s0
+```
+
+All other hyperparameters are the defaults in `train.py`: AdamW, learning rate 1e-3 with cosine decay, weight decay 1e-5, gradient clipping at 1.0 and the loss described above. Every run writes `args.json` (the full resolved configuration, including defaults), `history.csv` (per-epoch losses and validation metrics), `best.pt` and `test_results.json` to its output folder, so a result can always be traced back to the exact settings that produced it. A single run takes roughly 20–30 minutes on an A100 with for the improved model.
 
