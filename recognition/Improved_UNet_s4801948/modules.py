@@ -5,6 +5,10 @@ Contents
 ---------------------------------
 * UNet            : configurable-width/depth 2D U-Net (Ronneberger et al., 2015),
                     with BatchNorm and "same" padding so output size == input size.
+* ImprovedUNet    : 2D adaptation of the Improved U-Net: pre-activation residual context
+                    modules, dropout, instance norm, leaky ReLU, strided-conv
+                    downsampling, and deep supervision by summing multi-level segmentation maps.
+* build_model     : factory ("unet" | "improved").
 * DiceCELoss      : cross-entropy + soft Dice, both restricted to ``valid`` pixels
                     (the padded area added by dataset.py is ignored).
 * SegMetrics      : accumulates a confusion matrix over a whole split -> per-class

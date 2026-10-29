@@ -9,6 +9,13 @@ Features
 * Plots losses and metrics every epoch (training_curves.png), history in JSON/CSV.
 * Final test evaluation: per-class Dice/IoU, base/mid/apex prostate Dice (criterion A2),
   boundary leakage into rectum/bladder (A3), VRAM, training time, inference time (A4).
+
+Class ids (background, body, bone, bladder, rectum, prostate = 0..5) are set in dataset.py.
+
+Usage:
+    python train.py --root /path/to/data --out_dir runs/unet_b64_s0
+    python train.py --root /path/to/data --out_dir runs/unet_b64_s0 --resume   # after a time-out
+    python train.py --root /path/to/data --out_dir runs/unet_b64_s0 --test_only
 """
 
 import argparse
