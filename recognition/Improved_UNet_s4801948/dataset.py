@@ -1,3 +1,29 @@
+"""
+dataset.py -- data loading, patient-level splitting, preprocessing and augmentation
+for the HipMRI 2D slice dataset.
+
+Expected layout under ``root``:
+    keras_slices_train/
+    keras_slices_validate/
+    keras_slices_test/
+    keras_slices_seg_train/
+    keras_slices_seg_validate/
+    keras_slices_seg_test/
+
+Design notes
+------------
+* Patient-level splitting: slices of one patient (any week, any slice) never
+  appear in more than one split. The provided folders are verified for overlap;
+  if they leak, ``make_splits`` pools all files and re-splits by patient ID.
+* Image/mask alignment: files are paired by (patient, week, slice). Augmentation
+  applies ONE geometric transform to both (bilinear for image, nearest for mask).
+* Normalisation: per-slice z-score over non-zero (foreground) pixels.
+* Masks are returned as integer label maps (H, W); one-hot encoding is available
+  via ``to_one_hot`` or ``return_one_hot=True``.
+
+Run ``python dataset.py --root /path/to/data`` to print a data audit.
+"""
+
 import argparse
 import math
 import random

@@ -18,7 +18,6 @@ Outputs (in --out_dir, default <run_dir>/predictions/):
     predict_results.json      all printed numbers
 
 Each case row: input | ground truth | prediction | prostate FP/FN overlay | all-class errors.
-NumPy is used here for visualisation and bookkeeping (allowed in this script).
 """
 
 import argparse
