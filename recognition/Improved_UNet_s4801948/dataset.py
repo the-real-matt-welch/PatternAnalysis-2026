@@ -258,6 +258,17 @@ class HipMRIDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def preload(self):
+        """Fill the RAM cache in the calling process. Call BEFORE creating DataLoader
+        workers so forked workers share the cache instead of each building their own."""
+        if self._cache is None:
+            return
+        n = len(self.samples)
+        for i in range(n):
+            self._load(i)
+            if (i + 1) % 2000 == 0 or i + 1 == n:
+                print(f"[dataset] preloaded {i + 1}/{n}", flush=True)
+
     def _load(self, i):
         if self._cache is not None and i in self._cache:
             return self._cache[i]
@@ -304,8 +315,11 @@ def get_dataloaders(root, batch_size=16, num_classes=DEFAULT_NUM_CLASSES, augmen
         ds = HipMRIDataset(samples, num_classes=num_classes,
                            augment=JointAugment() if (augment and name == "train") else None,
                            return_one_hot=return_one_hot, target_hw=target_hw, cache=cache)
+        if cache:
+            ds.preload()
         loaders[name] = DataLoader(ds, batch_size=batch_size, shuffle=(name == "train"),
                                    num_workers=num_workers, pin_memory=torch.cuda.is_available(),
+                                   persistent_workers=num_workers > 0,
                                    drop_last=(name == "train"))
     return loaders, splits
 
