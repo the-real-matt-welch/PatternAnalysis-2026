@@ -159,12 +159,19 @@ All other hyperparameters are the defaults in `train.py`: AdamW, learning rate 1
 </p>
 <p align="center"><em>Figure 2. Predictions on test slices of median prostate Dice. Columns, left to right: input slice; ground-truth labels; predicted labels; prostate error overlay (green = true positive, red = false positive, blue = false negative); and every misclassified pixel (yellow). Row titles give the patient, week and slice number and the position of the slice along the gland.</em></p>
 
+Test slices with a median Dice score on the prostate were chosen as typical examples. It can be seen that contour maps are very similar to the ground truth, with
+slight pixel level errors occurring on class boundaries.
+
 ### Where along the gland the model fails
 
 <p align="center">
   <img src="resources/improved_dice_by_position.png" alt="Prostate Dice along the gland" width="650">
 </p>
-<p align="center"><em>Figure 4. Prostate Dice as a function of position along the gland, from the base (0, nearest the bladder) to the apex (1), pooled over the test volumes, with one thin line per test patient. The base end is identified automatically from the location of the ground-truth bladder in each volume.</em></p>
+<p align="center"><em>Figure 4. Prostate Dice as a function of position along the gland, from the base (0, nearest the bladder) to the apex (1), pooled over the test volumes, with one thin line per test patient.</em></p>
+
+As predicted in the feasibility report, the predictions are best in the middle third slices of each patient since this is where the prostate is most visible. The model
+does, however, still have surprisingly good performance in the base third and only falls off in the apex third where the prostate may take up only a few pixels.
+Despite this, the Dice score in each section is still good enough to pass the A2 criterion.
 
 ### Training behaviour and class confusion
 
@@ -172,6 +179,12 @@ All other hyperparameters are the defaults in `train.py`: AdamW, learning rate 1
   <img src="resources/improved_training_curves.png" alt="Training curves" width="900">
 </p>
 <p align="center"><em>Figure 5. Training curves of the Improved U-Net (seed 0): training and validation loss (left), validation mean foreground Dice and IoU (centre), and validation Dice for each class (right).</em></p>
+
+While the training loss continues to decrease over each epoch, validation loss finds its minimum rather early on. After ~15 epochs there are no more significant gains
+to be made in validation performance suggesting and further training is just overfitting to the train set. While this does mean that the model has likely hit the limit
+of its capabilities (more training time would likely not show any improvements), it is a benefit for more resource limited tasks. If training is too slow, 20 epochs
+would likely perform just as well as 50.
+
 <p align="center">
   <img src="resources/improved_confusion_matrix.png" alt="Pixel confusion matrix" width="500">
 </p>
