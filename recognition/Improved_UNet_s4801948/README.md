@@ -31,3 +31,70 @@ $$
 $$
 
 where $C = 6$ is the number of classes and $\varepsilon = 1$ is a smoothing constant. The Dice term is computed per class over the whole batch (not per slice), which keeps it stable for classes that appear in only some slices, and it averages over the five foreground classes only, so the large background class does not dominate. Cross-entropy provides well-behaved gradients early in training, while the Dice term directly optimises overlap and counteracts the extreme class imbalance.
+
+## Feasability Report
+
+**1. User Need, Scope & Acceptance Criteria**\
+**User and purpose.** The user is a radiation oncologist or imaging specialist who reviews and edits proposed contours on 2D pelvic MRI
+slices. The prototype is a contour proposal tool, not an autonomous contourer. The open dilemma is that a good global Dice can hide failures
+at the base and apex slices and leakage into the rectal wall or bladder. We therefore treat *where* errors occur as the primary outcome, and
+global Dice as secondary. Scope: a 2D U-Net baseline on HipMRI, with upgrades to an Improved U-Net if the baseline passes and time allows.
+All criteria are evaluated on a held-out, patient-level test split.
+
+
+| ID | Testable acceptance criterion (test split, mean over patients) | Addresses |
+| --- | --- | --- |
+| **A1** | Prostate DSC $\ge 0.75$ (target 0.90 stretch); every other class $\ge 0.75$; per-class IoU reported. | Global accuracy |
+| **A2** | Prostate DSC in the *base* and *apex* thirds of each patient's prostate extent $\ge 0.60$, with mid-gland minus worst-end gap $\le 0.15$. | Slice-transition failure |
+| **A3** | Leakage: predicted prostate pixels lying inside GT rectum/bladder $\le 5\%$ of predicted prostate area. | Boundary leakage |
+| **A4** | Resource: peak training VRAM $\le 8\text{ GB}$ (batch 16, AMP); inference $\le 50\text{ ms/slice}$; full training $\le 2\text{ GPU-h per run}$. | Operational budget |
+| **A5** | Zero patient overlap between train/val/test (asserted in code). A model upgrade is justified only if it gains $\ge 0.05$ DSC at base/apex (paired patient-level bootstrap, 95% CI excludes 0) at $\le 3\times$ baseline VRAM/time. | Validity & cost-benefit |
+
+**2. Model Choice & Course Concepts**\
+**Data.** HipMRI 2D slices (NIfTI, loaded with `nibabel`, Appendix B), with integer label maps one-hot encoded into $C$ channels (background,
+body, bone, bladder, rectum, prostate). Intensities are z-scored per volume using the foreground mean/std, and the image and mask are never
+resampled independently, so alignment is preserved. Splits are by patient ID, never by slice. **Model.** Baseline is the original U-Net
+(Ronneberger et al., 2015): a 4-level encoder--decoder with skip connections, with "same" padding (so output matches input size) and
+BatchNorm added. Base width is 32 or 64 filters (width is the main VRAM lever). Loss is cross-entropy plus soft Dice (Milletari et al., 2016),
+which counters the extreme class imbalance (prostate $<0.5\%$ of pixels). Optimiser is Adam (lr $10^{-3}$, cosine decay) with light
+augmentation (flips excluded, since left--right is anatomically meaningful; small affine and intensity jitter only). **Difficulty
+band.** Easy (upgrading to Normal based on time constraints): 2D U-Net baseline, with a stretch goal of an Improved U-Net as described in
+lecture material (dropout layers, residual blocks, etc). **Support.** Course material on CNNs, skip connections, class-imbalance losses and
+segmentation metrics; Taha & Hanbury (2015) motivate boundary metrics (HD95) alongside overlap metrics, and Isensee et al. (nnU-Net, 2021)
+show a well-configured U-Net is a strong baseline that many "advanced" variants fail to beat.
+
+**3. Preliminary Feasibility Evidence**\
+**Resource estimate.** A 64-filter, 4-level U-Net has $\approx 31$ M parameters ($\approx 124$ MB fp32). With gradients and Adam states,
+training state is $\approx 0.5$ GB. Activation memory for a $256\times128$ slice is roughly 0.2 GB/slice in fp32 (feature-map count
+summed over levels, including concatenations and saved BN/ReLU outputs), so batch 16 needs $\approx 3$ GB, and $\approx 4$ GB in total with CUDA
+overhead. This is well inside A4's 8 GB budget, and AMP roughly halves activations. Halving the width to 32 filters cuts parameters about
+$4\times$, giving a fallback if memory is tight.
+
+**Data Audit**:
+
+-   **Number of patients / slices.** 38 patients, 12,660 slices (train
+    31 / 11,460; val 4 / 660; test 3 / 540). 60 slices per patient-week
+    volume, weeks 0--7 (test has no week 6).
+-   **Image size and spacing.** 256×128 (all val/test; most train) and
+    256×144 (some train). Both are divisible by 16, so a 4-level U-Net
+    works.
+-   **Per-class pixel fraction.** Train: 17.3% / 67.5% / 12.5% / 1.9% /
+    0.36% / 0.43%.
+-   **Fraction of slices with no prostate.** Train: 36.9%.
+-   **Image--mask shape and affine equality check (pass/fail).** Pass:
+    11,460/11,460, 660/660 and 540/540 match on shape and affine; 0
+    out-of-range labels; no patient overlap between the provided splits.
+
+**4. Risks, Budget & Fallback**\
+**Key risks.** (i) *Class imbalance:* the model collapses to background; mitigated by Dice loss and monitoring per-class DSC every epoch. (ii)
+*Slice position unknown* in 2D data, which would block A2; mitigate by parsing filename indices or reconstructing volumes. (iii) *Small
+cohort,* giving high variance across patients; report mean $\pm$ SD over 3 seeds and use patient-level bootstrap CIs. (iv) *Silent leakage:*
+accidental slice-level splitting inflates scores; guarded by the A5 assertion. (v) *Label noise* at base/apex limits attainable DSC;
+interpret A2 relative to the baseline, not to 1.0.\ **Budget & next step.** Total plan $\approx$ 10 GPU-hours on one
+8--16 GB GPU: smoke test and audit 0.5 h; baseline $3$ seeds $\times$ 1.5 h $=$ 4.5 h; one upgrade ablation 3 h; evaluation and figures (GT /
+prediction / FP--FN difference overlays) 1 h; contingency 1 h. **Next experiment:** full baseline training with per-class, per-position
+(base/mid/apex) metrics. **Fallback:** if A4 is breached, drop to 32 filters, AMP and crop to the pelvic ROI; if prostate DSC $<0.75$, switch
+to a Tversky/focal loss or a two-stage ROI crop; if CAN/3D is unaffordable, report the 2.5D variant as the volumetric-context proxy
+and state the cost--benefit finding from A5 as the recommendation.
+
+
