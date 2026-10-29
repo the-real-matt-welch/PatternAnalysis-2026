@@ -22,6 +22,7 @@ FOLDERS = {
 _NAME_RE = re.compile(r"^(case|seg)_(\d+)_week_(\d+)_slice_(\d+)\.nii(\.gz)?$")
 
 DEFAULT_NUM_CLASSES = 6  # verify with audit_dataset(); label ids are 0..C-1
+CACHE_HW = (256, 144)  # canvas for the RAM cache; slices are stored top-left aligned
 
 
 def parse_filename(path):
@@ -46,9 +47,19 @@ def _index_folder(folder, kind):
 
 def _pair_folders(img_dir, seg_dir):
     """Pair image and seg files by key. Returns list of sample dicts."""
+    for d in (img_dir, seg_dir):
+        if not Path(d).is_dir():
+            raise FileNotFoundError(
+                f"Folder not found: {d}\n"
+                f"Check --root: it must contain the six keras_slices_* folders "
+                f"({', '.join(n for pair in FOLDERS.values() for n in pair)}).")
     imgs = _index_folder(img_dir, "case")
     segs = _index_folder(seg_dir, "seg")
     common = sorted(set(imgs) & set(segs))
+    if not common:
+        raise RuntimeError(
+            f"No paired slices found in {img_dir} / {seg_dir} "
+            f"({len(imgs)} case_ files, {len(segs)} seg_ files matched the naming pattern).")
     missing_seg = len(imgs) - len(common)
     missing_img = len(segs) - len(common)
     if missing_seg or missing_img:
@@ -253,25 +264,15 @@ class HipMRIDataset(Dataset):
         self.return_one_hot = return_one_hot
         self.target_hw = tuple(target_hw) if target_hw else None
         self.pad_multiple = pad_multiple  # only used when target_hw is None
-        self._cache = {} if cache else None
+        self._use_cache = cache
+        self._img_cache = None   # (N,1,H,W) float16, shared memory
+        self._mask_cache = None  # (N,H,W) int8
+        self._hw_cache = None    # (N,2) original (h, w)
 
     def __len__(self):
         return len(self.samples)
 
-    def preload(self):
-        """Fill the RAM cache in the calling process. Call BEFORE creating DataLoader
-        workers so forked workers share the cache instead of each building their own."""
-        if self._cache is None:
-            return
-        n = len(self.samples)
-        for i in range(n):
-            self._load(i)
-            if (i + 1) % 2000 == 0 or i + 1 == n:
-                print(f"[dataset] preloaded {i + 1}/{n}", flush=True)
-
-    def _load(self, i):
-        if self._cache is not None and i in self._cache:
-            return self._cache[i]
+    def _read_from_disk(self, i):
         s = self.samples[i]
         img = normalise_slice(torch.from_numpy(load_nifti_2d(s["image"])))
         mask = torch.from_numpy(np.rint(load_nifti_2d(s["mask"])).astype(np.int64))
@@ -280,10 +281,42 @@ class HipMRIDataset(Dataset):
         if mask.min() < 0 or mask.max() >= self.num_classes:
             raise ValueError(f"{s['mask']}: labels in [{int(mask.min())},{int(mask.max())}] "
                              f"outside 0..{self.num_classes - 1}")
-        out = (img.unsqueeze(0).half() if self._cache is not None else img.unsqueeze(0), mask)
-        if self._cache is not None:
-            self._cache[i] = out
-        return out
+        return img, mask
+
+    def preload(self):
+        """Fill the RAM cache in the calling process. Stored as three big shared-memory
+        tensors (not thousands of small ones) so DataLoader workers started with
+        fork/forkserver/spawn all work without exhausting file descriptors."""
+        if not self._use_cache or self._img_cache is not None:
+            return
+        n = len(self.samples)
+        H, W = CACHE_HW
+        imgs = torch.zeros(n, 1, H, W, dtype=torch.float16)
+        masks = torch.zeros(n, H, W, dtype=torch.int8)
+        hw = torch.zeros(n, 2, dtype=torch.int32)
+        for i in range(n):
+            img, mask = self._read_from_disk(i)
+            h, w = mask.shape
+            if h > H or w > W:
+                raise ValueError(f"Slice {(h, w)} exceeds cache canvas {CACHE_HW}")
+            imgs[i, 0, :h, :w] = img.half()
+            masks[i, :h, :w] = mask.to(torch.int8)
+            hw[i, 0], hw[i, 1] = h, w
+            if (i + 1) % 2000 == 0 or i + 1 == n:
+                print(f"[dataset] preloaded {i + 1}/{n}", flush=True)
+        self._img_cache = imgs.share_memory_()
+        self._mask_cache = masks.share_memory_()
+        self._hw_cache = hw.share_memory_()
+
+    def _load(self, i):
+        """Return (img (1,h,w) float32, mask (h,w) long) at the slice's original size."""
+        if not self._use_cache:
+            img, mask = self._read_from_disk(i)
+            return img.unsqueeze(0), mask
+        if self._img_cache is None:
+            self.preload()
+        h, w = int(self._hw_cache[i, 0]), int(self._hw_cache[i, 1])
+        return self._img_cache[i, :, :h, :w].float(), self._mask_cache[i, :h, :w].long()
 
     def __getitem__(self, i):
         img, mask = self._load(i)
