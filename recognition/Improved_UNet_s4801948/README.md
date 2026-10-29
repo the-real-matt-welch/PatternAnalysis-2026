@@ -150,3 +150,40 @@ python predict.py --root <root> --run_dir runs/improved_s0
 
 All other hyperparameters are the defaults in `train.py`: AdamW, learning rate 1e-3 with cosine decay, weight decay 1e-5, gradient clipping at 1.0 and the loss described above. Every run writes `args.json` (the full resolved configuration, including defaults), `history.csv` (per-epoch losses and validation metrics), `best.pt` and `test_results.json` to its output folder, so a result can always be traced back to the exact settings that produced it. A single run takes roughly 20–30 minutes on an A100 with for the improved model.
 
+## Examples Predictions and Visualisations
+
+### Predictions
+
+<p align="center">
+  <img src="resources/improved_cases_typical.png" alt="Typical predictions of the Improved U-Net" width="900">
+</p>
+<p align="center"><em>Figure 2. Predictions on test slices of median prostate Dice. Columns, left to right: input slice; ground-truth labels; predicted labels; prostate error overlay (green = true positive, red = false positive, blue = false negative); and every misclassified pixel (yellow). Row titles give the patient, week and slice number and the position of the slice along the gland.</em></p>
+
+### Where along the gland the model fails
+
+<p align="center">
+  <img src="resources/improved_dice_by_position.png" alt="Prostate Dice along the gland" width="650">
+</p>
+<p align="center"><em>Figure 4. Prostate Dice as a function of position along the gland, from the base (0, nearest the bladder) to the apex (1), pooled over the test volumes, with one thin line per test patient. The base end is identified automatically from the location of the ground-truth bladder in each volume.</em></p>
+
+### Training behaviour and class confusion
+
+<p align="center">
+  <img src="resources/improved_training_curves.png" alt="Training curves" width="900">
+</p>
+<p align="center"><em>Figure 5. Training curves of the Improved U-Net (seed 0): training and validation loss (left), validation mean foreground Dice and IoU (centre), and validation Dice for each class (right).</em></p>
+<p align="center">
+  <img src="resources/improved_confusion_matrix.png" alt="Pixel confusion matrix" width="500">
+</p>
+<p align="center"><em>Figure 6. Pixel confusion matrix on the test split. Each row shows how the pixels of one ground-truth class were classified, as a percentage of that class.</em></p>
+
+## Pre-processing
+
+All pre-processing is implemented in `dataset.py`.
+
+- **Loading.** Each slice and its mask are read with `nibabel` and squeezed to a 2D array. Neither is resampled, reoriented or cropped, and no bias-field correction or histogram matching is applied. A data audit confirmed that every image and its mask have identical shape and affine, so they stay pixel-aligned throughout.
+- **Intensity normalisation.** MRI intensities have no fixed physical scale, so they are not comparable across scans without normalisation (Nyúl and Udupa, 1999). Each slice is standardised independently with a z-score computed over its non-zero (foreground) pixels, `(x − mean) / (std + 1e-6)`, which stops the large empty background from distorting the statistics.
+- **Label encoding.** Masks are rounded to integers and checked to lie in 0–5; an out-of-range label raises an error. They are kept as integer maps and converted to a one-hot, six-channel encoding when the Dice loss and the metrics are computed.
+- **Fixed-size canvas.** The training split contains slices of both 256×128 and 256×144 pixels, while the validation and test splits are all 256×128. To batch them together, every slice is padded at the bottom and right to 256×144, with the slice's minimum intensity for the image and class 0 for the mask. A boolean `valid` mask marks the real pixels, and the loss and all metrics are computed only over them, so the padding never counts as background. Both sizes are divisible by 16, as the four downsampling steps require.
+- **Patient-level splitting.** Slices from the same patient are highly correlated, so the data is split by patient. The provided train, validation and test folders (31, 4 and 3 patients) are checked for shared patients on every run, and if any overlap were found, the code would re-split by patient identifier.
+
