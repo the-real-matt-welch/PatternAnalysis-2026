@@ -7,7 +7,7 @@
 - [Examples Predictions and Visualisations](#examples-predictions-and-visualisations)
 - [Pre-processing](#pre-processing)
 - [Investigation and Results](#investigation-and-results)
-- [Use of Artificial Intelligence](#use-of-artificial-intelligence)
+- [Artificial Intelligence Usage Disclosure](#artificial-intelligence-usage-disclosure)
 
 ## Overview
 
@@ -297,7 +297,7 @@ Build the contouring prototype on the plain 2D U-Net. On this evidence the Impro
 | 2D Improved U-Net | 0.788 / 0.859 | 12.7 M parameters, 1.8 GB, 0.44 h, 4.2 ms/slice | Measured | No accuracy gain; consider only if model size matters |
 
 
-## Use of Artificial Intelligence
+## Artificial Intelligence Usage Disclosure
 Parts of this project were created with the assistance of artificial intelligence. Specifically, Claude was used to
 
 - Help scaffold python files
