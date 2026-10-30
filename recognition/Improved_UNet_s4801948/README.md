@@ -1,10 +1,17 @@
 # Improved U-Net for Prostate MRI Segmentation (HipMRI)
 
+## Table of Contents
+- [Overview](#overview)
+- [Feasibility Report](#feasibility-report)
+- [Dependencies and Reproducibility](#dependencies-and-reproducibility)
+- [Examples Predictions and Visualisations](#examples-predictions-and-visualisations)
+- [Pre-processing](#pre-processing)
+- [Investigation and Results](#investigation-and-results)
+- [Use of Artificial Intelligence](#use-of-artificial-intelligence)
+
 ## Overview
 
 In prostate radiotherapy planning, the prostate and the surrounding organs at risk (bladder, rectum and bone) must be delineated on MRI with millimetre-level accuracy. Under-contouring the prostate risks tumour recurrence, while over-contouring irradiates healthy rectal and bladder wall and causes radiation toxicity. Manual delineation is slow, and an annotation assistant that proposes contours for a specialist to review and adjust could save considerable clinical time. This project builds the segmentation engine for such an assistant: a 2D convolutional network that assigns every pixel of a HipMRI pelvic MRI slice to one of six classes (background, body, bone, bladder, rectum, prostate). The task is hard for three reasons. The prostate is tiny (about 0.4% of all pixels in the training data), so a model can score well overall while barely segmenting it. Soft-tissue boundaries are low-contrast, and the thin interface between prostate, rectum and bladder is exactly where errors are clinically costly. And a good average Dice score can hide failures at the top (base) and bottom (apex) of the gland. We therefore implement the Improved U-Net, an extension of the original U-Net, and evaluate it against a standard 2D U-Net baseline, paying particular attention to where along the gland errors occur and not only to the global score.
-
-## How it works
 
 The network is an encoder–decoder with skip connections (see the figure below). A slice is z-score normalised, padded to a fixed 256×144 canvas and passed through a stem convolution. The encoder then halves the resolution four times with stride-2 convolutions, doubling the channels each time (32 → 512), and after each step applies a context module: a pre-activation residual block (instance normalisation → leaky ReLU → 3×3 conv, then dropout and a second normalisation → activation → conv, added back to its input). Putting normalisation and activation before the convolutions leaves the identity path untouched, which improves gradient flow, and instance normalisation keeps training stable with small batches. The decoder reverses the process: each level upsamples the coarser features, concatenates the encoder features from the same resolution (the skip connection, which restores the fine spatial detail lost by downsampling), and refines them in a localization module. In addition, the network uses deep supervision: 1×1 convolutions at the three finest decoder levels each produce a segmentation map, and these maps are upsampled and summed element-wise into the final prediction, so that earlier decoder layers receive a direct training signal. The model outputs six per-pixel scores, and the argmax gives the predicted label map. It is trained with a combined cross-entropy and soft-Dice loss (the Dice term counteracts the class imbalance, see below for the specific function), computed only over real, non-padded pixels. The 2D baseline uses the same data pipeline and loss, but plain double-convolution blocks with batch normalisation, no dropout and no deep supervision.
 
@@ -288,3 +295,16 @@ Build the contouring prototype on the plain 2D U-Net. On this evidence the Impro
 |:---|:---|:---|:---|:---|
 | 2D U-Net (baseline) | 0.796 / 0.864 | 31.0 M parameters, 2.6 GB, 0.54 h, 2.4 ms/slice | Measured |   Use for the prototype   |
 | 2D Improved U-Net | 0.788 / 0.859 | 12.7 M parameters, 1.8 GB, 0.44 h, 4.2 ms/slice | Measured | No accuracy gain; consider only if model size matters |
+
+
+## Use of Artificial Intelligence
+Parts of this project were created with the assistance of artificial intelligence. Specifically, Claude was used to
+
+- Help scaffold python files
+- Format output for cleaner logging
+- Format documentation for clarity
+- Assist in formatting graphs and figures
+- Occasionally assist in debugging
+- Generate the `architecture.png` image from a detailed description of the Improved U-Net architecture used
+
+Apart from file scaffolds (which were fairly small and quick to verify) any AI code or fixes were generated as a single function or class at a time. This allowed me to carefully examine each update to make sure the implementation actually did what I wanted and gave me a chance to test AI written functionality one piece at a time. This would occasionally result in a tweak to or rewrite of the code. No raw AI output was committed to the repository.
