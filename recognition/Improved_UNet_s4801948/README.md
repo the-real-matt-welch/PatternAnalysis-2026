@@ -167,7 +167,7 @@ slight pixel level errors occurring on class boundaries.
 <p align="center">
   <img src="resources/improved_dice_by_position.png" alt="Prostate Dice along the gland" width="650">
 </p>
-<p align="center"><em>Figure 4. Prostate Dice as a function of position along the gland, from the base (0, nearest the bladder) to the apex (1), pooled over the test volumes, with one thin line per test patient.</em></p>
+<p align="center"><em>Figure 3. Prostate Dice as a function of position along the gland, from the base (0, nearest the bladder) to the apex (1), pooled over the test volumes, with one thin line per test patient.</em></p>
 
 As predicted in the feasibility report, the predictions are best in the middle third slices of each patient since this is where the prostate is most visible. The model
 does, however, still have surprisingly good performance in the base third and only falls off in the apex third where the prostate may take up only a few pixels.
@@ -178,7 +178,7 @@ Despite this, the Dice score in each section is still good enough to pass the A2
 <p align="center">
   <img src="resources/improved_training_curves.png" alt="Training curves" width="900">
 </p>
-<p align="center"><em>Figure 5. Training curves of the Improved U-Net (seed 0): training and validation loss (left), validation mean foreground Dice and IoU (centre), and validation Dice for each class (right).</em></p>
+<p align="center"><em>Figure 4. Training curves of the Improved U-Net (seed 0): training and validation loss (left), validation mean foreground Dice and IoU (centre), and validation Dice for each class (right).</em></p>
 
 While the training loss continues to decrease over each epoch, validation loss finds its minimum rather early on. After ~15 epochs there are no more significant gains
 to be made in validation performance suggesting and further training is just overfitting to the train set. While this does mean that the model has likely hit the limit
@@ -188,7 +188,7 @@ would likely perform just as well as 50.
 <p align="center">
   <img src="resources/improved_confusion_matrix.png" alt="Pixel confusion matrix" width="500">
 </p>
-<p align="center"><em>Figure 6. Pixel confusion matrix on the test split. Each row shows how the pixels of one ground-truth class were classified, as a percentage of that class.</em></p>
+<p align="center"><em>Figure 5. Pixel confusion matrix on the test split. Each row shows how the pixels of one ground-truth class were classified, as a percentage of that class.</em></p>
 
 ## Pre-processing
 
@@ -263,7 +263,20 @@ Both models sit far inside the operating budget. The improved model is smaller a
 
 ### Error autopsy
 
-**TODO!!!**
+<p align="center">
+  <img src="resources/improved_cases_worst.png" alt="Lowest-scoring prostate slices of the baseline" width="900">
+</p>
+<p align="center"><em>Figure 6. The test slices with the lowest prostate Dice.</em></p>
+
+Figure 7 shows the worst failure cases of the Improved model. Note that each of these cases represents totally missing the prostate as opposed to a bad outline. All of these occur in cases where the prostate is very small in the image and therefore easy to miss. While this is inconvenient for the contourer, it is much less dangerous than potential boundary errors that involve significant leakage of prostate pixels into surrounding areas. Note also from the confusion matrix in figure 5 that any misclassified prostate pixels are always classified as `body` and never as `rectum` or `bladder`. Since these examples were all caused by missing the prostate, which leads to
+a prostate Dice of 0, we will also examine false positive cases for the prostate class.
+
+<p align="center">
+  <img src="resources/improved_cases_false_positive.png" alt="Baseline prostate Dice along the gland" width="650">
+</p>
+<p align="center"><em>Figure 7. False positive cases for the prostate class.</em></p>
+
+Figure 8 displays all five cases where the model predicted prostate pixels but none existed in the ground truth for the slice. Four are patient 40 at slices 53–54 in weeks 0 and 3, next to the rectum, and the same slices recur across weeks, which points to a consistent anatomical trigger, not noise. Once again, this tool is just proposed as an assistant, so an experienced contourer should be able to correct cases like this at minimal inconvenience due to their rarity.
 
 ### Recommendation to the project manager
 
