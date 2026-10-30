@@ -200,3 +200,78 @@ All pre-processing is implemented in `dataset.py`.
 - **Fixed-size canvas.** The training split contains slices of both 256×128 and 256×144 pixels, while the validation and test splits are all 256×128. To batch them together, every slice is padded at the bottom and right to 256×144, with the slice's minimum intensity for the image and class 0 for the mask. A boolean `valid` mask marks the real pixels, and the loss and all metrics are computed only over them, so the padding never counts as background. Both sizes are divisible by 16, as the four downsampling steps require.
 - **Patient-level splitting.** Slices from the same patient are highly correlated, so the data is split by patient. The provided train, validation and test folders (31, 4 and 3 patients) are checked for shared patients on every run, and if any overlap were found, the code would re-split by patient identifier.
 
+## Investigation and Results
+
+### Question and scope
+
+Radiotherapy contouring needs accurate boundaries at the base and apex of the prostate and at its interfaces with the bladder and rectum, yet a global Dice score is dominated by the large, easy mid-gland slices. The question for the project manager is whether a more sophisticated model removes the hazardous end-slice and boundary errors, or merely polishes slices that were already good while costing more compute.
+
+This investigation tests an Improved U-Net architecture for this task against a simpler U-Net baseline. The ideal goal is both improved performance and lower resource usage, allowing the Improved model to trained and used in environments with tighter budgets.
+
+All results are test-split means ± SD over three seeds. Δ is the improved model minus the baseline, ± the standard error of that difference. These intervals capture training-seed variation only. The test set holds just three patients (nine volumes of the same three people), so the choice of patients is a larger source of uncertainty than the seeds.
+
+### Quantitative benchmark
+
+**Table 1. Per-class test Dice and IoU.**
+
+| Class | Baseline Dice | Improved Dice | Δ Dice | Baseline IoU | Improved IoU | Δ IoU |
+|:---|---:|---:|---:|---:|---:|---:|
+| Background | 0.996 ± 0.000 | 0.996 ± 0.001 | +0.000 ± 0.000 | 0.993 ± 0.001 | 0.993 ± 0.001 | +0.000 ± 0.001 |
+| Body | 0.986 ± 0.000 | 0.986 ± 0.000 | +0.000 ± 0.000 | 0.972 ± 0.001 | 0.972 ± 0.001 | +0.000 ± 0.001 |
+| Bone | 0.941 ± 0.001 | 0.941 ± 0.001 | +0.000 ± 0.001 | 0.888 ± 0.002 | 0.889 ± 0.002 | +0.000 ± 0.002 |
+| Bladder | 0.967 ± 0.000 | 0.966 ± 0.001 | −0.001 ± 0.000 | 0.935 ± 0.001 | 0.934 ± 0.001 | −0.001 ± 0.001 |
+| Rectum | 0.875 ± 0.003 | 0.862 ± 0.009 | −0.013 ± 0.006 | 0.778 ± 0.006 | 0.758 ± 0.014 | −0.020 ± 0.009 |
+|   Prostate   |   0.875 ± 0.006   |   0.874 ± 0.003   | −0.001 ± 0.004 |   0.778 ± 0.009   |   0.776 ± 0.004   | −0.002 ± 0.006 |
+| Mean foreground | 0.929 ± 0.001 | 0.926 ± 0.003 | −0.003 ± 0.002 | 0.870 ± 0.002 | 0.866 ± 0.004 | −0.005 ± 0.003 |
+
+**Table 2. Boundary-sensitive results: where along the gland, and at which interfaces.** Position thirds are taken from the extent of the ground-truth prostate in each test volume; the base is the end nearest the bladder.
+
+| Metric | Baseline | Improved | Δ |
+|:---|---:|---:|---:|
+| Prostate Dice, base third | 0.864 ± 0.005 | 0.859 ± 0.014 | −0.005 ± 0.008 |
+| Prostate Dice, mid third | 0.918 ± 0.000 | 0.922 ± 0.001 | +0.005 ± 0.000 |
+| Prostate Dice, apex third | 0.796 ± 0.012 | 0.788 ± 0.014 | −0.008 ± 0.010 |
+| Gap: mid − worst end (criterion A2 limit 0.15) | 0.121 ± 0.012 | 0.134 ± 0.014 | +0.013 ± 0.010 |
+| Predicted prostate leaking into rectum | 0.05 ± 0.03 % | 0.07 ± 0.05 % | +0.02 ± 0.03 % |
+| Predicted prostate leaking into bladder | 0.46 ± 0.25 % | 0.74 ± 0.19 % | +0.28 ± 0.18 % |
+| Prostate Dice, patient 40 | 0.879 ± 0.008 | 0.877 ± 0.003 | −0.002 ± 0.005 |
+| Prostate Dice, patient 41 | 0.879 ± 0.004 | 0.865 ± 0.010 | −0.013 ± 0.006 |
+| Prostate Dice, patient 42 | 0.864 ± 0.009 | 0.870 ± 0.006 | +0.006 ± 0.006 |
+| Apex-third Dice, patient 41 | 0.792 ± 0.007 | 0.764 ± 0.021 | −0.027 ± 0.013 |
+
+**Acceptance criteria.** Both models met criteria A1 (prostate Dice ≥ 0.75, and every class ≥ 0.75), A2 (base and apex thirds ≥ 0.60, mid-gland no more than 0.15 above the worse end) and A3 (leakage ≤ 5%) in all three of their seeds.
+
+**Interpretation of results.**
+
+The overall accuracy between the Improved U-Net and the baseline is indistinguishable. Prostate Dice is 0.875 ± 0.006 for the baseline and 0.874 ± 0.003 for the improved model (Δ −0.001 ± 0.004). The only class that moves is the rectum (Δ −0.013 ± 0.006), roughly two standard errors, which is suggestive but not conclusive with three seeds. Additionally, both models had negligible leakage. Under 0.1% of predicted prostate pixels fall in the rectum and under 1% in the bladder, far below the 5% limit. The improved model's bladder leakage is slightly higher (0.74% vs 0.46%). This shows that, in terms of performance, the Improved model offers no advantages over a baseline U-Net. There may, however, still be reason to prefer the Improved U-Net in cases where low resource usage matters. This will be more closely examined in the next section.
+
+### Resource profile
+
+**Table 3. Computational cost** (single A100 GPU; means ± SD over three seeds; batch size 16 for training).
+
+| Measure | Baseline U-Net | Improved U-Net | Improved ÷ Baseline | Budget (A4) |
+|:---|---:|---:|---:|---:|
+| Parameters | 31.04 M | 12.74 M | 0.41× | n/a |
+| Peak training VRAM | 2.58 GB | 1.80 GB | 0.70× | ≤ 8 GB |
+| Training time (50 epochs) | 0.54 h | 0.44 h | 0.82× | ≤ 2 h |
+| Inference, batch of 1 | 2.35 ± 0.04 ms/slice | 4.21 ± 0.20 ms/slice | 1.79× | ≤ 50 ms |
+| Inference, batch of 32 | 2.05 ± 0.29 ms/slice | 2.00 ± 0.25 ms/slice | 0.98× | n/a |
+| Whole volume (60 slices, batch of 1) | ≈ 0.14 s | ≈ 0.25 s | 1.79x | n/a |
+
+Both models sit far inside the operating budget. The improved model is smaller and uses less memory, but it is slower per slice at batch size 1 (many small operations, and instance normalisation) and no faster when batched. Peak VRAM and training time are taken from each real training run. While this is a slight improvement in training resources, it is likely insignificant; if the resources exist to train the improved model then they can likely afford the baseline as well. Additionally, the slower inference times (while also likely insignificant) could add up over large batches of contouring. The convenience of training time and resources does not justify the slight losses in performance and inference speed.
+
+
+### Error autopsy
+
+**TODO!!!**
+
+### Recommendation to the project manager
+
+**Build the contouring prototype on the plain 2D U-Net.** On this evidence the Improved U-Net adds no accuracy where it matters (the apex and base thirds, and leakage at the organ interfaces) and the baseline already meets every acceptance criterion at about 2.6 GB of VRAM, about half an hour of training and about 2 ms per slice. Neither model came close to any resource limit, so cost is not the deciding factor here. The Improved U-Net adds nothing of value.
+
+**Table 4. Trade-off synthesis.**
+
+| Option | Apex / base prostate Dice | Compute | Evidence | Recommendation |
+|:---|:---|:---|:---|:---|
+| 2D U-Net (baseline) | 0.796 / 0.864 | 31.0 M parameters, 2.6 GB, 0.54 h, 2.4 ms/slice | Measured |   Use for the prototype   |
+| 2D Improved U-Net | 0.788 / 0.859 | 12.7 M parameters, 1.8 GB, 0.44 h, 4.2 ms/slice | Measured | No accuracy gain; consider only if model size matters |
